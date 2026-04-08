@@ -1,14 +1,14 @@
 schema_version: 1
 kind: tool
-display_name: "创建异步任务"
-name: create_async_task
-description: Create a background task in the main runtime.
+display_name: "续跑任务"
+name: continue_task
+description: Continue an existing task in exactly one controlled mode.
 source:
   type: ''
   url: ''
   ref: ''
 current_version:
-  summary: Resource-local task runtime tool. Handler and governance live with the resource so discovery can refresh without a host restart.
+  summary: Resource-local continuation tool for recreate or in-place retry.
   compare_rule: Treat manifest, main/, parameter contract, or returned payload changes as version-relevant.
   source_of_truth: resource.yaml, main/, and toolskills together define the effective behavior.
 requires:
@@ -21,15 +21,18 @@ permissions:
 parameters:
   type: object
   properties:
-    task:
+    mode:
       type: string
-      description: User request to dispatch as a background task.
-    core_requirement:
+      enum: [recreate, retry_in_place]
+    target_task_id:
       type: string
-      description: One-sentence distilled core requirement for the task tree.
+      description: Existing task id to continue. Must use `task:...`.
+    continuation_instruction:
+      type: string
+      description: Continuation directive used as recreate prompt or in-place retry context.
     execution_policy:
       type: [object, string]
-      description: Execution policy for the task.
+      description: Optional execution policy override.
       properties:
         mode:
           type: string
@@ -38,18 +41,24 @@ parameters:
       required: [mode]
     requires_final_acceptance:
       type: boolean
-      description: Whether the root execution should be followed by final acceptance.
+      description: Whether the continuation should require final acceptance.
     final_acceptance_prompt:
       type: string
       description: Required when `requires_final_acceptance=true`.
-  required: [task, core_requirement, execution_policy]
+    reuse_existing:
+      type: boolean
+      description: Reuse an in-progress recreated continuation task when possible.
+    reason:
+      type: string
+      description: Short continuation reason such as heartbeat_stall or manual_retry.
+  required: [mode, target_task_id, continuation_instruction]
 governance:
   family: task_runtime
   display_name: Task Runtime
-  description: Create background tasks in the main runtime.
+  description: Continue existing tasks in the main runtime.
   actions:
-    - id: create_async_task
-      label: Create Async Task
+    - id: continue_task
+      label: Continue Task
       risk_level: medium
       destructive: false
       allowed_roles:
