@@ -2,4 +2,4 @@ from g3ku.agent.tools.filesystem_mutation import build_single_purpose_filesystem
 
 
 def build(runtime):
-    return build_single_purpose_filesystem_tool(runtime, action='write')
+    return build_single_purpose_filesystem_tool(runtime, action='move')
