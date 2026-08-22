@@ -10,6 +10,8 @@ import json
 import math
 import re
 import uuid
+
+from loguru import logger
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -30,7 +32,7 @@ from g3ku.json_schema_utils import (
 )
 from g3ku.providers.base import normalize_usage_payload
 from g3ku.providers.base_chat_model_adapter import G3kuChatModelAdapter
-from g3ku.providers.fallback import PUBLIC_PROVIDER_FAILURE_MESSAGE
+from g3ku.providers.fallback import PUBLIC_PROVIDER_FAILURE_MESSAGE, ModelProviderExhaustedError
 from g3ku.providers.openai_codex_provider import (
     _convert_messages as _preview_responses_messages,
     _convert_tools as _preview_responses_tools,
@@ -41,11 +43,10 @@ from g3ku.runtime.context.summarizer import estimate_tokens
 from g3ku.runtime.config_refresh import refresh_loop_runtime_config
 from g3ku.runtime.project_environment import current_project_environment
 from g3ku.runtime.message_token_estimation import estimate_message_tokens
+from g3ku.runtime.stage_prompt_compaction import decompose_stage_prompt_messages
 from g3ku.runtime.tool_visibility import CEO_FIXED_BUILTIN_TOOL_NAMES
 from g3ku.runtime.frontdoor.token_preflight_compaction import (
-    FRONTDOOR_COMPACTED_HISTORY_MAX_TOKENS,
     FrontdoorTokenPreflightResult,
-    compact_frontdoor_history_zone,
 )
 from main.governance.tool_context import apply_runtime_tool_context_projection
 from main.models import normalize_execution_policy_metadata
@@ -152,27 +153,6 @@ class FrontdoorCompressionRuntimeError(RuntimeError):
         self.code = str(code or "").strip() or "runtime_error"
         self.message = str(message or "").strip()
         self.recoverable = bool(recoverable)
-
-
-@dataclass(frozen=True, slots=True)
-class _FrontdoorTokenPreflightPolicy:
-    max_context_tokens: int
-    trigger_ratio: float
-    trigger_tokens: int
-
-
-def _build_frontdoor_token_preflight_policy(
-    *,
-    max_context_tokens: int,
-    trigger_ratio: float,
-) -> _FrontdoorTokenPreflightPolicy:
-    normalized_max = max(0, int(max_context_tokens or 0))
-    normalized_ratio = max(0.0, float(trigger_ratio or 0.0))
-    return _FrontdoorTokenPreflightPolicy(
-        max_context_tokens=normalized_max,
-        trigger_ratio=normalized_ratio,
-        trigger_tokens=int(normalized_max * normalized_ratio),
-    )
 
 
 def _estimate_frontdoor_provider_request_tokens(
@@ -401,14 +381,6 @@ def _estimate_frontdoor_provider_request_token_breakdown(
         "image_count": len(image_blocks),
         "image_estimation_method": _DEFAULT_IMAGE_ESTIMATION_METHOD if image_blocks else "",
     }
-
-
-def _should_run_frontdoor_token_preflight(
-    *,
-    final_request_tokens: int,
-    policy: _FrontdoorTokenPreflightPolicy,
-) -> bool:
-    return int(final_request_tokens or 0) >= int(policy.trigger_tokens)
 
 
 class _CeoStructuredTool(StructuredTool):
@@ -731,10 +703,64 @@ class CeoFrontDoorRuntimeOps(CeoFrontDoorSupport):
         cls,
         request_messages: list[dict[str, Any]] | None,
     ) -> list[dict[str, Any]]:
-        return strip_multimodal_blocks_from_message_records(
+        durable = strip_multimodal_blocks_from_message_records(
             cls._strip_frontdoor_turn_only_artifacts(
                 cls._request_body_messages_without_tool_contracts(request_messages)
             )
+        )
+        # 不变量：durable 基线永不含 frontdoor 运行时工具契约块。
+        # 若混入（旧版本遗留/回归），直接丢弃，避免污染跨回合基线。
+        return [
+            item
+            for item in durable
+            if not cls._is_frontdoor_tool_contract_record(item)
+        ]
+
+    @classmethod
+    def _trim_frontdoor_seed_to_stage_window(
+        cls,
+        seed: list[dict[str, Any]] | None,
+        stage_state: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """把续跑 seed（上一份请求体基线）裁到「前缀+压缩块+最近窗口」，
+        使存量大会话在续跑路径也能真正收缩，而不是携带未裁剪旧体重新膨胀。"""
+        records = [dict(item) for item in list(seed or []) if isinstance(item, dict)]
+        if not records or not list((stage_state or {}).get("stages") or []):
+            return records
+        parts = decompose_stage_prompt_messages(
+            records,
+            stage_state=stage_state,
+            keep_latest_completed_stages=3,
+            preserve_leading_system=True,
+            preserve_leading_user=True,
+        )
+        return [
+            *list(parts["prefix"]),
+            *list(parts["completed_blocks"]),
+            *list(parts["active_window"]),
+        ]
+
+    def _quarantine_frontdoor_shrink(
+        self,
+        session: Any,
+        *,
+        new_seed: list[dict[str, Any]],
+        previous_tokens: int,
+        next_tokens: int,
+    ) -> None:
+        """检测到「无理由收缩」时不裸抛冻结会话，而是把拒绝后的新种子
+        以受控原因写回基线，使后续回合对比一致、会话可自愈。"""
+        consecutive = int(getattr(session, "_frontdoor_shrink_quarantine_count", 0) or 0) + 1
+        setattr(session, "_frontdoor_shrink_quarantine_count", consecutive)
+        durable_seed = self._durable_frontdoor_request_body_messages(new_seed)
+        setattr(session, "_frontdoor_request_body_messages", durable_seed)
+        setattr(session, "_frontdoor_history_shrink_reason", "context_shrink_quarantine")
+        logger.warning(
+            "frontdoor shrink quarantined (self-heal): prev={} next={} consecutive={} session={}",
+            previous_tokens,
+            next_tokens,
+            consecutive,
+            getattr(getattr(session, "state", None), "session_key", ""),
         )
 
     def _ceo_image_multimodal_enabled_for_model_refs(self, model_refs: list[str] | None) -> bool:
@@ -1116,105 +1142,6 @@ class CeoFrontDoorRuntimeOps(CeoFrontDoorSupport):
             return records
         records[-1] = {**last, "content": content}
         return records
-
-    @classmethod
-    def _rewrite_frontdoor_request_messages_with_compacted_history(
-        cls,
-        *,
-        request_messages: list[dict[str, Any]],
-        compacted_history: Any,
-    ) -> list[dict[str, Any]]:
-        body_messages, contract_messages = cls._split_request_body_and_tool_contract_messages(request_messages)
-        if not body_messages:
-            return [dict(item) for item in list(request_messages or []) if isinstance(item, dict)]
-
-        normalized_body = [dict(item) for item in body_messages if isinstance(item, dict)]
-        system_prefix: list[dict[str, Any]] = []
-        if normalized_body and str(normalized_body[0].get("role") or "").strip().lower() == "system":
-            system_prefix = [dict(normalized_body[0])]
-            normalized_body = normalized_body[1:]
-
-        recent_tail_count = min(len(normalized_body), 4)
-        if recent_tail_count <= 0 or len(normalized_body) <= recent_tail_count:
-            return [*system_prefix, *normalized_body, *contract_messages]
-
-        recent_tail = [dict(item) for item in normalized_body[-recent_tail_count:]]
-        return [
-            *system_prefix,
-            dict(getattr(compacted_history, "compacted_block", {}) or {}),
-            *recent_tail,
-            *contract_messages,
-        ]
-
-    def _run_frontdoor_token_preflight_compaction(
-        self,
-        *,
-        state: CeoGraphState,
-        request_messages: list[dict[str, Any]],
-        tool_schemas: list[dict[str, Any]],
-        provider_request_body: dict[str, Any] | None,
-    ) -> FrontdoorTokenPreflightResult:
-        assembly_cfg = getattr(getattr(self._loop, "_memory_runtime_settings", None), "assembly", None)
-        policy = _build_frontdoor_token_preflight_policy(
-            max_context_tokens=int(
-                getattr(assembly_cfg, "frontdoor_compaction_max_context_tokens", 200000) or 200000
-            ),
-            trigger_ratio=float(
-                getattr(assembly_cfg, "frontdoor_compaction_trigger_ratio", 0.10) or 0.10
-            ),
-        )
-        final_request_tokens = _estimate_frontdoor_provider_request_tokens(
-            provider_request_body=provider_request_body,
-            request_messages=request_messages,
-            tool_schemas=tool_schemas,
-        )
-        diagnostics: dict[str, Any] = {
-            "applied": False,
-            "final_request_tokens": final_request_tokens,
-            "trigger_tokens": int(policy.trigger_tokens),
-            "max_context_tokens": int(policy.max_context_tokens),
-        }
-        if not _should_run_frontdoor_token_preflight(
-            final_request_tokens=final_request_tokens,
-            policy=policy,
-        ):
-            return FrontdoorTokenPreflightResult(
-                request_messages=list(request_messages),
-                final_request_tokens=final_request_tokens,
-                history_shrink_reason="",
-                diagnostics=diagnostics,
-            )
-
-        compacted_history = compact_frontdoor_history_zone(
-            raw_history_messages=self._request_body_messages_without_tool_contracts(request_messages),
-            frontdoor_stage_state=dict(state.get("frontdoor_stage_state") or {}),
-            max_compacted_tokens=FRONTDOOR_COMPACTED_HISTORY_MAX_TOKENS,
-        )
-        rewritten_messages = self._rewrite_frontdoor_request_messages_with_compacted_history(
-            request_messages=request_messages,
-            compacted_history=compacted_history,
-        )
-        rewritten_tokens = _estimate_frontdoor_provider_request_tokens(
-            provider_request_body=None,
-            request_messages=rewritten_messages,
-            tool_schemas=tool_schemas,
-        )
-        diagnostics.update(
-            {
-                "applied": True,
-                "compacted_block_tokens": int(getattr(compacted_history, "compacted_block_tokens", 0) or 0),
-                "retained_completed_stage_ids": list(
-                    getattr(compacted_history, "retained_completed_stage_ids", []) or []
-                ),
-                "final_request_tokens": rewritten_tokens,
-            }
-        )
-        return FrontdoorTokenPreflightResult(
-            request_messages=rewritten_messages,
-            final_request_tokens=rewritten_tokens,
-            history_shrink_reason="token_compression",
-            diagnostics=diagnostics,
-        )
 
     def _resolve_frontdoor_send_model_context_window(
         self,
@@ -3059,7 +2986,9 @@ class CeoFrontDoorRuntimeOps(CeoFrontDoorSupport):
                 ).strip()
                 if actual_tool_schema_hash:
                     setattr(target_session, "_frontdoor_actual_tool_schema_hash", actual_tool_schema_hash)
-            request_body_messages = strip_multimodal_blocks_from_message_records(
+            # 基线持久化统一走 durable 归一（剥工具契约/瞬时件/多模态），
+            # 与守卫对比侧、新回合种子保持同一形态，避免契约块漏进基线。
+            request_body_messages = self._durable_frontdoor_request_body_messages(
                 [
                     dict(item)
                     for item in list(state.get("frontdoor_request_body_messages") or [])
@@ -5105,7 +5034,14 @@ class CeoFrontDoorRuntimeOps(CeoFrontDoorSupport):
             current_turn_user_content
         )
         if session_request_body_messages:
-            request_body_seed_messages = list(session_request_body_messages)
+            # 接通 stage 数据源：优先 frontdoor_stage_state，为空时回退 canonical 的 stages，
+            # 使续跑路径的 seed 裁剪能拿到完成阶段摘要（无损裁剪的前提）。
+            seed_stage_state = dict(current_frontdoor_stage_state or {})
+            if not list(seed_stage_state.get("stages") or []):
+                seed_stage_state = dict(current_frontdoor_canonical_context or {})
+            request_body_seed_messages = self._trim_frontdoor_seed_to_stage_window(
+                session_request_body_messages, seed_stage_state
+            )
             checkpoint_messages = []
             builder_user_metadata["_frontdoor_history_seed"] = "session_window"
             has_prior_request_body_seed = True
@@ -5469,18 +5405,30 @@ class CeoFrontDoorRuntimeOps(CeoFrontDoorSupport):
             # Both sides are note-neutral: the turn-only note is stripped from the
             # carried history before this turn and re-appended fresh at the tail,
             # so stripping it here must not count as an illegal shrink.
+            # 两侧同形归一：基线与新种子都先剥工具契约/瞬时件/多模态，
+            # 再比 token。历史上基线曾混入末位工具契约块，导致新回合（已剥契约）
+            # 被误判为「无理由收缩」而永久冻结。
             previous_tokens = estimate_message_tokens(
                 CeoMessageBuilder._request_body_seed_records(
-                    strip_turn_only_system_note_messages(session_request_body_messages)
+                    strip_turn_only_system_note_messages(
+                        self._request_body_messages_without_tool_contracts(session_request_body_messages)
+                    )
                 )
             )
             next_tokens = estimate_message_tokens(
                 CeoMessageBuilder._request_body_seed_records(
-                    strip_turn_only_system_note_messages(persisted_messages)
+                    strip_turn_only_system_note_messages(
+                        self._request_body_messages_without_tool_contracts(persisted_messages)
+                    )
                 )
             )
             if next_tokens < previous_tokens and shrink_reason not in self._ALLOWED_FRONTDOOR_SHRINK_REASONS.difference({""}):
-                raise RuntimeError("frontdoor context shrank without an allowed reason")
+                self._quarantine_frontdoor_shrink(
+                    session,
+                    new_seed=persisted_messages,
+                    previous_tokens=previous_tokens,
+                    next_tokens=next_tokens,
+                )
         parallel_enabled, max_parallel_tool_calls = self._parallel_tool_settings()
         return {
             "session_key": str(getattr(session.state, "session_key", "") or ""),
@@ -5917,7 +5865,7 @@ class CeoFrontDoorRuntimeOps(CeoFrontDoorSupport):
                         on_text_delta=assistant_text_delta_handler,
                     )
                 except Exception as exc:
-                    if PUBLIC_PROVIDER_FAILURE_MESSAGE not in str(exc or ""):
+                    if not isinstance(exc, ModelProviderExhaustedError) and PUBLIC_PROVIDER_FAILURE_MESSAGE not in str(exc or ""):
                         raise
                     if self._refresh_runtime_config_for_retry_invalidation():
                         state_for_request["model_refs"] = list(self._resolve_ceo_model_refs())
@@ -5925,7 +5873,9 @@ class CeoFrontDoorRuntimeOps(CeoFrontDoorSupport):
                         break
                     provider_retry_count += 1
                     if provider_retry_count >= _PROVIDER_RETRY_LIMIT:
-                        raise RuntimeError(PUBLIC_PROVIDER_FAILURE_MESSAGE) from exc
+                        # Re-raise the original exception so the raw provider
+                        # error reaches the frontend unwrapped.
+                        raise
                     await asyncio.sleep(float(min(10, max(1, provider_retry_count))))
                     continue
                 response_view = self._model_response_view(message)

@@ -20,6 +20,13 @@ type LateDeliverRoute = {
   onError?: (err: unknown, info: { kind: string }) => void;
 };
 
+type ProactiveDeliverParams = {
+  channel: string;
+  accountId: string;
+  target: { kind: string; id: string };
+  text: string;
+};
+
 type RuntimeBridgeOptions = {
   host: string;
   port: number;
@@ -71,6 +78,7 @@ export class G3kuRuntimeBridge {
   private client: WebSocket | null = null;
   private pending = new Map<string, PendingTurn>();
   private lateDeliverRoutes = new Map<string, LateDeliverRoute>();
+  private proactiveDeliver: ((params: ProactiveDeliverParams) => Promise<void> | void) | null = null;
   private readonly channelsConfig: Record<string, any>;
   readonly runtime: Record<string, unknown>;
   readonly channelRuntime: Record<string, unknown>;
@@ -83,6 +91,16 @@ export class G3kuRuntimeBridge {
       error: (msg: string) => this.logger.error(msg),
       channel: this.channelRuntime,
     };
+  }
+
+  /**
+   * Register the channel-level proactive sender used when a late final
+   * deliver_message frame has no remembered route (e.g. right after a host
+   * restart, before any inbound message re-populates lateDeliverRoutes).
+   * Without this fallback such frames were dropped silently.
+   */
+  setProactiveDeliver(fn: ((params: ProactiveDeliverParams) => Promise<void> | void) | null): void {
+    this.proactiveDeliver = fn;
   }
 
   async start(): Promise<void> {
@@ -141,23 +159,56 @@ export class G3kuRuntimeBridge {
   private async handleFrame(frame: BridgeFrame): Promise<void> {
     if (frame.type === "deliver_message") {
       const mode = String(frame.payload?.mode || "progress");
-      if (mode !== "final") return;
+      if (mode !== "final") {
+        if (mode === "progress") {
+          // 过程信息帧（QQ 传输层的工具/阶段里程碑）。只在回合进行中有效：
+          // 对应 pending 不存在时直接丢弃——回合已结束，残留过程消息是噪声，
+          // 不走 lateDeliverRoutes 兜底。
+          const progressPending = this.pending.get(frame.event_id);
+          if (!progressPending) return;
+          try {
+            await progressPending.deliver(
+              {
+                text: frame.payload?.text,
+                mediaUrls: undefined,
+                mediaUrl: undefined,
+              },
+              { kind: "progress" },
+            );
+          } catch (err) {
+            progressPending.onError?.(err, { kind: "progress" });
+          }
+        }
+        return;
+      }
       const pending = this.pending.get(frame.event_id);
       if (!pending) {
         const lateRoute = this.resolveLateDeliverRoute(frame);
-        if (!lateRoute) return;
-        try {
-          await lateRoute.deliver(
-            {
-              text: frame.payload?.text,
-              mediaUrls: undefined,
-              mediaUrl: undefined,
-            },
-            { kind: "final" },
-          );
-        } catch (err) {
-          lateRoute.onError?.(err, { kind: "final" });
+        // qqbot 的迟到 final 帧绝不复用旧回合的 deliver 闭包：闭包里的
+        // C2C markdown 缓冲是回合级状态，回合结束后无人再冲洗，结构化
+        // 文本会被永久困在孤儿缓冲里（cron 提醒丢消息的实证根因）；
+        // 被动回复上下文同样已过期。改走无状态的主动发送兜底。
+        // 其他渠道暂无主动兜底实现，保留旧路由行为。
+        if (lateRoute && String(frame.channel || "").trim() !== "qqbot") {
+          try {
+            await lateRoute.deliver(
+              {
+                text: frame.payload?.text,
+                mediaUrls: undefined,
+                mediaUrl: undefined,
+              },
+              { kind: "final" },
+            );
+          } catch (err) {
+            lateRoute.onError?.(err, { kind: "final" });
+          }
+          return;
         }
+        // No usable pending/route path (or qqbot, see above). This also
+        // covers the right-after-host-restart case where lateDeliverRoutes
+        // is still empty. Fall back to the channel proactive sender instead
+        // of dropping the frame silently.
+        await this.deliverProactiveFallback(frame);
         return;
       }
       const info = { kind: "final" as const };
@@ -326,6 +377,33 @@ export class G3kuRuntimeBridge {
     };
     for (const key of keys) {
       this.lateDeliverRoutes.set(key, route);
+    }
+  }
+
+  private async deliverProactiveFallback(frame: Extract<BridgeFrame, { type: "deliver_message" }>): Promise<void> {
+    const text = String(frame.payload?.text || "");
+    const channel = String(frame.channel || "").trim();
+    const accountId = String(frame.account_id || "default").trim() || "default";
+    const target = {
+      kind: String(frame.target?.kind || "user").trim() || "user",
+      id: String(frame.target?.id || "").trim(),
+    };
+    if (!this.proactiveDeliver || !text.trim() || !target.id) {
+      this.logger.warn(
+        `late deliver_message dropped: no route for channel=${channel} account=${accountId} target=${target.kind}:${target.id}` +
+          (this.proactiveDeliver ? "" : " (no proactive sender registered)"),
+      );
+      return;
+    }
+    try {
+      await this.proactiveDeliver({ channel, accountId, target, text });
+      this.logger.info(
+        `late deliver_message sent via proactive fallback channel=${channel} account=${accountId} target=${target.kind}:${target.id} textLen=${text.length}`,
+      );
+    } catch (err) {
+      this.logger.error(
+        `proactive fallback delivery failed channel=${channel} target=${target.kind}:${target.id}: ${String(err)}`,
+      );
     }
   }
 

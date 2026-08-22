@@ -4070,15 +4070,25 @@ function renderCeoLiveStreamTextIntoTurn(turn) {
 function ceoLiveStreamResidual(turn, summary) {
     let residual = String(turn?.liveStreamText || "");
     if (!residual.trim()) return "";
+    // 轨道上已渲染的文本（preamble + 各 round.text）从 live 流里按
+    // 出现位置删掉，剩下的才是真正还没进轨的尾巴。子串级删除对「间隙旁白、
+    // 建阶段 preamble、空白符差异」都不再断链；按轨道顺序找最早出现位置，
+    // 避免 echo 场景删错新的那一段。
+    const absorb = (text) => {
+        const normalized = String(text || "").trim();
+        if (!normalized) return;
+        const index = residual.indexOf(normalized);
+        if (index >= 0) {
+            residual = residual.slice(0, index) + residual.slice(index + normalized.length);
+        }
+    };
     for (const stage of summary?.stages || []) {
+        absorb(stage?.preamble_text);
         for (const round of stage?.rounds || []) {
-            const roundText = String(round?.text || "").trim();
-            if (roundText && residual.startsWith(roundText)) {
-                residual = residual.slice(roundText.length);
-            }
+            absorb(round?.text);
         }
     }
-    return residual;
+    return residual.trim();
 }
 
 function renderCeoAssistantTextIntoTurn(turn, text = "", { status = "" } = {}) {
@@ -5709,9 +5719,15 @@ function finalizeCeoTurn(text, meta = {}) {
     const normalizedSource = normalizeCeoTurnSource(meta?.source || "user");
     const normalizedTurnId = normalizeCeoTurnId(meta?.turn_id || "");
     const finalCanonicalContext = normalizeCeoSnapshotCanonicalContext(meta?.canonical_context || null);
-    const finalTraceContext = resolveFinalCeoTraceContext(meta || {});
     const finalUserMessages = normalizeCeoSnapshotUserMessages(meta?.user_messages, meta?.user_message);
     const turn = pullActiveCeoTurn(normalizedSource, normalizedTurnId);
+    // final 事件带的 canonical 数据优先（后端在 delta 为空时会连 canonical_context 一起省略）；
+    // 缺失时回退到本轮在 run 中自己渲染出的轨道（lastExecutionTraceSummary），
+    // 避免「阶段在最终答复后消失、刷新才回来」。该兜底是当前轮的 per-turn delta，
+    // 不会回填旧轮次全量 trace；心跳轮没有 live 轨道（null）不受影响。
+    const finalTraceContext = resolveFinalCeoTraceContext(meta || {})
+        || turn?.lastExecutionTraceSummary
+        || null;
     if (finalUserMessages.length) {
         const updatedEntry = patchCeoSessionSnapshotCache(sessionId, (entry) => {
             const inflightTurn = normalizeCeoSnapshotInflight(entry?.inflight_turn);
@@ -6884,7 +6900,7 @@ function renderModelDetail() {
                             </label>
                             <label class="resource-field">
                                 <span class="resource-field-label">Retry On</span>
-                                <input class="resource-search" name="retryOn" value="${esc((current?.retry_on || []).join(", "))}" placeholder="如 network, 429, 5xx">
+                                <input class="resource-search" name="retryOn" value="${esc((current?.retry_on || []).join(", "))}" placeholder="如 network, 429, 502（可自定义关键词，逗号分隔）">
                             </label>
                             <label class="resource-field">
                                 <span class="resource-field-label">重试次数</span>
